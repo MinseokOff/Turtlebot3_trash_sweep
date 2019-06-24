@@ -1,0 +1,2744 @@
+#!/usr/bin/env python
+
+import rospy
+#from math import pow, atan2, sqrt
+from tf.transformations import *
+
+import smach
+import smach_ros
+from smach_ros import SimpleActionState
+from smach_ros import ServiceState
+
+import threading
+
+# Navigation
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from nav_msgs.msg import Odometry
+#from geometry_msgs.msg import Twist
+
+# Manipulator
+from geometry_msgs.msg import Pose
+from open_manipulator_msgs.msg import JointPosition
+from open_manipulator_msgs.msg import KinematicsPose
+from open_manipulator_msgs.srv import SetJointPosition
+from open_manipulator_msgs.srv import SetKinematicsPose
+
+# AR Markers
+from ar_track_alvar_msgs.msg import AlvarMarker
+from ar_track_alvar_msgs.msg import AlvarMarkers
+
+# Path planning
+from geometry_msgs.msg import Twist, Point, Quaternion
+import tf
+from math import *
+import numpy as np
+
+
+
+class Pause(smach.State):
+    def __init__(self):
+	smach.State.__init__(self, outcomes=['succeeded', 'aborted'],input_keys=['input_time'])
+	
+    def execute(self, userdata):
+	time = userdata.input_time
+        rospy.sleep(time)
+    	return 'succeeded'
+
+
+
+class Getodom(smach.State):
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['succeeded', 'aborted'],output_keys=['output_origin_pose', 'output_origin_angle'])
+        self.namespace = rospy.get_param("~robot_name")
+        self.tf_listener = tf.TransformListener()
+        self.odom_frame = self.namespace+'/odom'
+        #self.reset_odom = rospy.Publisher(self.namespace+'/base_footprint', Empty)
+
+    def get_odom(self):
+        try:
+            (trans, rot) = self.tf_listener.lookupTransform(self.odom_frame, self.base_frame, rospy.Time(0))
+            rotation = euler_from_quaternion(rot)
+
+        except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+            rospy.loginfo("TF Exception")
+            return
+
+        return (Point(*trans), rotation[2])
+
+    def execute(self, userdata):
+        position = Point()
+        r = rospy.Rate(40)
+
+
+        try:
+            self.tf_listener.waitForTransform(self.odom_frame, self.namespace+'/base_footprint', rospy.Time(), rospy.Duration(1.0))
+            self.base_frame = self.namespace+'/base_footprint'
+        except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+            try:
+                self.tf_listener.waitForTransform(self.odom_frame, self.namespace+'/base_link', rospy.Time(), rospy.Duration(1.0))
+                self.base_frame = self.namespace+'/base_link'
+            except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+                rospy.loginfo("Cannot find transform between odom and base_link or base_footprint")
+                rospy.signal_shutdown("tf Exception")
+
+
+        (position, rotation) = self.get_odom()
+        (userdata.output_origin_pose, userdata.output_origin_angle) = (position, rotation)
+
+
+        rospy.sleep(4.)
+
+        return 'succeeded'
+
+
+class GotoPoint(smach.State):
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['succeeded', 'aborted'],input_keys=['input_vector', 'input_origin_pose','input_origin_angle'])
+        self.namespace = rospy.get_param("~robot_name")
+        self.cmd_vel = rospy.Publisher(self.namespace+'/cmd_vel', Twist, queue_size=5)
+        self.tf_listener = tf.TransformListener()
+        self.odom_frame = self.namespace+'/odom'
+
+    def get_odom(self):
+        try:
+            (trans, rot) = self.tf_listener.lookupTransform(self.odom_frame, self.base_frame, rospy.Time(0))
+            rotation = euler_from_quaternion(rot)
+
+        except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+            rospy.loginfo("TF Exception")
+            return
+
+        return (Point(*trans), rotation[2])
+
+    def execute(self, userdata):
+        position = Point()
+        move_cmd = Twist()
+        r = rospy.Rate(40)
+
+        try:
+            self.tf_listener.waitForTransform(self.odom_frame, self.namespace+'/base_footprint', rospy.Time(), rospy.Duration(1.0))
+            self.base_frame = self.namespace+'/base_footprint'
+        except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+            try:
+                self.tf_listener.waitForTransform(self.odom_frame, self.namespace+'/base_link', rospy.Time(), rospy.Duration(1.0))
+                self.base_frame = self.namespace+'/base_link'
+            except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+                rospy.loginfo("Cannot find transform between odom and base_link or base_footprint")
+                rospy.signal_shutdown("tf Exception")
+
+        (position, rotation) = self.get_odom()
+        last_rotation = 0
+        linear_speed = 1.5
+        angular_speed = 1
+        [input_x, input_y, input_z] = userdata.input_vector
+
+        goal_x = input_x*cos(userdata.input_origin_angle)-input_y*sin(userdata.input_origin_angle)
+        goal_y = input_x*sin(userdata.input_origin_angle)+input_y*cos(userdata.input_origin_angle)
+        '''
+        if goal_z > 180 or goal_z < -180:
+            print("you input worng z range.")
+            self.shutdown()
+        '''
+        goal_z = np.deg2rad(input_z)
+
+
+        goal_x += userdata.input_origin_pose.x
+        goal_y += userdata.input_origin_pose.y
+        goal_z += userdata.input_origin_angle
+
+
+        if goal_z > pi:
+            goal_z -=2*pi
+        elif goal_z< -pi:
+            goal_z += 2*pi
+
+        goal_distance = sqrt(pow(goal_x - position.x, 2) + pow(goal_y - position.y, 2))
+        distance = goal_distance
+
+        while distance > 0.05:
+            (position, rotation) = self.get_odom()
+            x_start = position.x
+            y_start = position.y
+            path_angle = atan2(goal_y - y_start, goal_x- x_start)
+
+            if path_angle < -pi/4 or path_angle > pi/4:
+                if goal_y < 0 and y_start < goal_y:
+                    path_angle = -2*pi + path_angle
+                elif goal_y >= 0 and y_start > goal_y:
+                    path_angle = 2*pi + path_angle
+            if last_rotation > pi-0.1 and rotation <= 0:
+                rotation = 2*pi + rotation
+            elif last_rotation < -pi+0.1 and rotation > 0:
+                rotation = -2*pi + rotation
+            move_cmd.angular.z = angular_speed * path_angle-rotation
+
+            distance = sqrt(pow((goal_x - x_start), 2) + pow((goal_y - y_start), 2))
+            move_cmd.linear.x = min(linear_speed * distance, 0.15)
+	    '''
+            if move_cmd.angular.z > 0:
+                move_cmd.angular.z = min(move_cmd.angular.z, 1.5)
+            else:
+                move_cmd.angular.z = max(move_cmd.angular.z, -1.5)
+	    '''
+            last_rotation = rotation
+            self.cmd_vel.publish(move_cmd)
+            r.sleep()
+
+        (position, rotation) = self.get_odom()
+
+
+        while abs(rotation - goal_z) > 0.05:
+            (position, rotation) = self.get_odom()
+            if goal_z >= 0:
+                if rotation <= goal_z and rotation >= goal_z - pi:
+                    move_cmd.linear.x = 0.00
+                    move_cmd.angular.z = 0.4
+                else:
+                    move_cmd.linear.x = 0.00
+                    move_cmd.angular.z = -0.4
+            else:
+                if rotation <= goal_z + pi and rotation > goal_z:
+                    move_cmd.linear.x = 0.00
+                    move_cmd.angular.z = -0.4
+                else:
+                    move_cmd.linear.x = 0.00
+                    move_cmd.angular.z = 0.4
+            self.cmd_vel.publish(move_cmd)
+            print(rotation)
+            r.sleep()
+
+        #rospy.sleep(5.)
+        rospy.loginfo("Stopping the robot...")
+        self.cmd_vel.publish(Twist())
+
+        return 'succeeded'
+
+class Move(smach.State):
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['succeeded', 'aborted'], input_keys=['input_speed_distance'])
+
+        self.namespace = rospy.get_param("~robot_name")
+        self.cmd_vel_pub = rospy.Publisher(self.namespace + '/cmd_vel', Twist, queue_size=10)
+        self.cmd_vel = Twist()
+        
+
+    def execute(self, userdata):
+        r = rospy.Rate(40)
+
+	[self.speed, self.distance] = userdata.input_speed_distance
+        
+
+        t0 = rospy.Time.now().to_sec()
+        current_distance = 0
+
+        while (abs(current_distance) < abs(self.distance)):
+	    self.cmd_vel.linear.x  = self.speed
+            self.cmd_vel.linear.y  = 0.0
+            self.cmd_vel.linear.z  = 0.0
+            self.cmd_vel_pub.publish(self.cmd_vel)
+            t1=rospy.Time.now().to_sec()
+            current_distance= self.speed*(t1-t0)
+	    r.sleep()
+
+        self.cmd_vel.linear.x = 0.0
+        self.cmd_vel.linear.y = 0.0
+        self.cmd_vel.linear.z = 0.0
+        self.cmd_vel_pub.publish(self.cmd_vel)
+
+
+        return 'succeeded'
+
+def main():
+    rospy.init_node('task_and_place_state_machine')
+    namespace = rospy.get_param("~robot_name")
+    planning_group = rospy.get_param("~planning_group")
+
+    # Create the sub SMACH state machine
+    task_center = smach.StateMachine(outcomes=['succeeded','aborted','preempted'])
+
+    # Open the container
+    with task_center:
+
+        task_center.userdata.planning_group = planning_group
+
+        def joint_position_request_cb_1(userdata, request):
+            joint = JointPosition()
+            joint.position = userdata.input_position
+            joint.max_velocity_scaling_factor = 1.0
+            joint.max_accelerations_scaling_factor = 1.0
+
+            request.planning_group = userdata.input_planning_group
+            request.joint_position = joint
+            return request
+
+        def joint_position_response_cb_1(userdata, response):
+            if response.is_planned == False:
+                return 'aborted'
+            else:
+                rospy.sleep(2.)
+                return 'succeeded'
+
+        def gripper_request_cb_1(userdata, request):
+             joint = JointPosition()
+             joint.position = userdata.input_gripper
+             joint.max_velocity_scaling_factor = 1.0
+             joint.max_accelerations_scaling_factor = 1.0
+
+             request.planning_group = userdata.input_planning_group
+             request.joint_position = joint
+             return request
+
+        def gripper_response_cb_1(userdata, response):
+             rospy.sleep(1.)
+             return 'succeeded'	
+
+        def joint_position_request_cb(userdata, request):
+            joint = JointPosition()
+            joint.position = userdata.input_position
+            joint.max_velocity_scaling_factor = 1.0
+            joint.max_accelerations_scaling_factor = 1.0
+
+            request.planning_group = userdata.input_planning_group
+            request.joint_position = joint
+            return request
+
+        def joint_position_response_cb(userdata, response):
+            if response.is_planned == False:
+                return 'aborted'
+            else:
+                rospy.sleep(3.5)
+                return 'succeeded'
+
+        def gripper_request_cb(userdata, request):
+             joint = JointPosition()
+             joint.position = userdata.input_gripper
+             joint.max_velocity_scaling_factor = 1.0
+             joint.max_accelerations_scaling_factor = 1.0
+
+             request.planning_group = userdata.input_planning_group
+             request.joint_position = joint
+             return request
+
+        def gripper_response_cb(userdata, response):
+             rospy.sleep(1.)
+             return 'succeeded'	
+
+        def joint_position_request_cb_2(userdata, request):
+            joint = JointPosition()
+            joint.position = userdata.input_position
+            joint.max_velocity_scaling_factor = 1.0
+            joint.max_accelerations_scaling_factor = 1.0
+
+            request.planning_group = userdata.input_planning_group
+            request.joint_position = joint
+            return request
+
+        def joint_position_response_cb_2(userdata, response):
+            if response.is_planned == False:
+                return 'aborted'
+            else:
+                rospy.sleep(4.)
+                return 'succeeded'
+	
+        the_location_of_origin = MoveBaseGoal()
+        the_location_of_origin.target_pose.header.frame_id = "map"
+        the_location_of_origin.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_origin.target_pose.pose.position.x = 0.0
+        the_location_of_origin.target_pose.pose.position.y = 0.0
+        the_location_of_origin.target_pose.pose.position.z = 0.0
+        the_location_of_origin.target_pose.pose.orientation.w = 0.999
+        the_location_of_origin.target_pose.pose.orientation.x = 0.0
+        the_location_of_origin.target_pose.pose.orientation.y = 0.0
+        the_location_of_origin.target_pose.pose.orientation.z = 0.0349
+
+        the_location_of_trashcan = MoveBaseGoal()
+        the_location_of_trashcan.target_pose.header.frame_id = "map"
+        the_location_of_trashcan.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_trashcan.target_pose.pose.position.x = 3.5
+        the_location_of_trashcan.target_pose.pose.position.y = -1.5
+        the_location_of_trashcan.target_pose.pose.position.z = 0.0
+        the_location_of_trashcan.target_pose.pose.orientation.w = 0.707
+        the_location_of_trashcan.target_pose.pose.orientation.x = 0.0
+        the_location_of_trashcan.target_pose.pose.orientation.y = 0.0
+        the_location_of_trashcan.target_pose.pose.orientation.z = 0.707
+
+        the_location_of_point_1 = MoveBaseGoal()
+        the_location_of_point_1.target_pose.header.frame_id = "map"
+        the_location_of_point_1.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_1.target_pose.pose.position.x = 3.4
+        the_location_of_point_1.target_pose.pose.position.y = -0.25
+        the_location_of_point_1.target_pose.pose.position.z = 0.0
+        the_location_of_point_1.target_pose.pose.orientation.w = -0.02618
+        the_location_of_point_1.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_1.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_1.target_pose.pose.orientation.z = 0.999
+
+        the_location_of_point_2 = MoveBaseGoal()
+        the_location_of_point_2.target_pose.header.frame_id = "map"
+        the_location_of_point_2.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_2.target_pose.pose.position.x = 0
+        the_location_of_point_2.target_pose.pose.position.y = -0.6
+        the_location_of_point_2.target_pose.pose.position.z = 0.0
+        the_location_of_point_2.target_pose.pose.orientation.w = 0.999
+        the_location_of_point_2.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_2.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_2.target_pose.pose.orientation.z = 0.02618
+
+        the_location_of_point_3 = MoveBaseGoal()
+        the_location_of_point_3.target_pose.header.frame_id = "map"
+        the_location_of_point_3.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_3.target_pose.pose.position.x = 3.4
+        the_location_of_point_3.target_pose.pose.position.y = -0.75
+        the_location_of_point_3.target_pose.pose.position.z = 0.0
+        the_location_of_point_3.target_pose.pose.orientation.w = 0
+        the_location_of_point_3.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_3.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_3.target_pose.pose.orientation.z = 1
+
+        the_location_of_point_4 = MoveBaseGoal()
+        the_location_of_point_4.target_pose.header.frame_id = "map"
+        the_location_of_point_4.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_4.target_pose.pose.position.x = 0
+        the_location_of_point_4.target_pose.pose.position.y = -1.25
+        the_location_of_point_4.target_pose.pose.position.z = 0.0
+        the_location_of_point_4.target_pose.pose.orientation.w = 0.999
+        the_location_of_point_4.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_4.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_4.target_pose.pose.orientation.z = 0.02618
+
+        the_location_of_point_5 = MoveBaseGoal()
+        the_location_of_point_5.target_pose.header.frame_id = "map"
+        the_location_of_point_5.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_5.target_pose.pose.position.x = 3.4
+        the_location_of_point_5.target_pose.pose.position.y = -1.25
+        the_location_of_point_5.target_pose.pose.position.z = 0.0
+        the_location_of_point_5.target_pose.pose.orientation.w = 0
+        the_location_of_point_5.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_5.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_5.target_pose.pose.orientation.z = 1
+
+        the_location_of_point_6 = MoveBaseGoal()
+        the_location_of_point_6.target_pose.header.frame_id = "map"
+        the_location_of_point_6.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_6.target_pose.pose.position.x = 0
+        the_location_of_point_6.target_pose.pose.position.y = -1.60
+        the_location_of_point_6.target_pose.pose.position.z = 0.0
+        the_location_of_point_6.target_pose.pose.orientation.w = 0.999
+        the_location_of_point_6.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_6.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_6.target_pose.pose.orientation.z = 0.02618
+
+        the_location_of_point_7 = MoveBaseGoal()
+        the_location_of_point_7.target_pose.header.frame_id = "map"
+        the_location_of_point_7.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_7.target_pose.pose.position.x = 3.4
+        the_location_of_point_7.target_pose.pose.position.y = -1.65
+        the_location_of_point_7.target_pose.pose.position.z = 0.0
+        the_location_of_point_7.target_pose.pose.orientation.w = 0
+        the_location_of_point_7.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_7.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_7.target_pose.pose.orientation.z = 1
+
+        the_location_of_point_8 = MoveBaseGoal()
+        the_location_of_point_8.target_pose.header.frame_id = "map"
+        the_location_of_point_8.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_8.target_pose.pose.position.x = 0
+        the_location_of_point_8.target_pose.pose.position.y = -2
+        the_location_of_point_8.target_pose.pose.position.z = 0.0
+        the_location_of_point_8.target_pose.pose.orientation.w = 0.999
+        the_location_of_point_8.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_8.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_8.target_pose.pose.orientation.z = 0.02618
+
+        the_location_of_point_91 = MoveBaseGoal()
+        the_location_of_point_91.target_pose.header.frame_id = "map"
+        the_location_of_point_91.target_pose.header.stamp    = rospy.Time.now()
+        the_location_of_point_91.target_pose.pose.position.x = 3.4
+        the_location_of_point_91.target_pose.pose.position.y = -1.25
+        the_location_of_point_91.target_pose.pose.position.z = 0.0
+        the_location_of_point_91.target_pose.pose.orientation.w = 0.707
+        the_location_of_point_91.target_pose.pose.orientation.x = 0.0
+        the_location_of_point_91.target_pose.pose.orientation.y = 0.0
+        the_location_of_point_91.target_pose.pose.orientation.z = -0.707
+
+	
+        #GOKGWANGYEE READY
+        task_center.userdata.a_0 = [0.008]
+        smach.StateMachine.add('A_0',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'A_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'a_0'})
+
+        task_center.userdata.a_1 = [0.0, 0.55, -0.942, 1.85]
+        smach.StateMachine.add('A_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_A',
+                                            'aborted':'A_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'a_1'})
+
+	task_center.userdata.time_a = 1
+        smach.StateMachine.add('PAUSE_A', Pause(),
+                                transitions={'succeeded':'A_2'},
+                                remapping={'input_time':'time_a'})
+
+
+        task_center.userdata.a_2 = [-0.005]
+        smach.StateMachine.add('A_2',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'A_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'a_2'})
+
+        task_center.userdata.a_3 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('A_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'GO_TO_ORIGIN_1',
+                                             'aborted':'A_3'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'a_3'})
+
+	
+
+	#Go To Origine
+
+	smach.StateMachine.add('GO_TO_ORIGIN_1',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_origin),
+                                transitions={'succeeded':'PAUSE'})
+
+	task_center.userdata.time = 2
+        smach.StateMachine.add('PAUSE', Pause(),
+                                transitions={'succeeded':'MOVE_B_2'},
+                                remapping={'input_time':'time'})
+
+
+	
+	#Swip 1
+
+	task_center.userdata.move_vel_dist_b_1 = [0.06, 0.1]
+        smach.StateMachine.add('MOVE_B', Move(),
+                              transitions={'succeeded':'MOVE_B_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_b_1'})
+
+	task_center.userdata.move_vel_dist_b_3 = [0.2, 3.1]
+        smach.StateMachine.add('MOVE_B_2', Move(),
+                              transitions={'succeeded':'PAUSE_B'},
+                              remapping={'input_speed_distance':'move_vel_dist_b_3'})
+
+	task_center.userdata.time_b = 2
+        smach.StateMachine.add('PAUSE_B', Pause(),
+                                transitions={'succeeded':'B_0'},
+                                remapping={'input_time':'time_b'})
+
+        task_center.userdata.b_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('B_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'B_1',
+                                            'aborted':'B_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'b_0'})
+
+        task_center.userdata.b_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('B_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'B_2',
+                                            'aborted':'B_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'b_1'})
+
+
+        task_center.userdata.b_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('B_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'B_3',
+                                            'aborted':'B_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'b_2'})
+
+
+        task_center.userdata.b_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('B_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_B_1',
+                                            'aborted':'B_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'b_3'})
+
+
+        task_center.userdata.time_b_1 = 1
+        smach.StateMachine.add('PAUSE_B_1', Pause(),
+                                transitions={'succeeded':'B_4'},
+                                remapping={'input_time':'time_b_1'})
+
+
+        task_center.userdata.b_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('B_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'B_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'b_4'})
+
+        task_center.userdata.b_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('B_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_B_2',
+                                             'aborted':'B_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'b_5'})
+
+	task_center.userdata.time_b_2 = 1
+        smach.StateMachine.add('PAUSE_B_2', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_B'},
+                                remapping={'input_time':'time_b_2'})
+
+	smach.StateMachine.add('GO_TO_POINT_B',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_1),
+                                transitions={'succeeded':'PAUSE_B_3'})
+
+	task_center.userdata.time_b_3 = 2
+        smach.StateMachine.add('PAUSE_B_3', Pause(),
+                                transitions={'succeeded':'MOVE_C'},
+                                remapping={'input_time':'time_b_3'})
+
+	#Swip 2
+
+	task_center.userdata.move_vel_dist_c_1 = [0.06, 0.1]
+        smach.StateMachine.add('MOVE_C', Move(),
+                              transitions={'succeeded':'MOVE_C_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_c_1'})
+
+	task_center.userdata.move_vel_dist_c_3 = [0.2, 3.1]
+        smach.StateMachine.add('MOVE_C_2', Move(),
+                              transitions={'succeeded':'PAUSE_C'},
+                              remapping={'input_speed_distance':'move_vel_dist_c_3'})
+
+	task_center.userdata.time_c = 2
+        smach.StateMachine.add('PAUSE_C', Pause(),
+                                transitions={'succeeded':'C_0'},
+                                remapping={'input_time':'time_c'})
+
+        task_center.userdata.c_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('C_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'C_1',
+                                            'aborted':'C_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'c_0'})
+
+        task_center.userdata.c_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('C_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'C_2',
+                                            'aborted':'C_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'c_1'})
+
+
+        task_center.userdata.c_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('C_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'C_3',
+                                            'aborted':'C_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'c_2'})
+
+
+        task_center.userdata.c_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('C_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_C_1',
+                                            'aborted':'C_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'c_3'})
+
+
+        task_center.userdata.time_c_1 = 1
+        smach.StateMachine.add('PAUSE_C_1', Pause(),
+                                transitions={'succeeded':'C_4'},
+                                remapping={'input_time':'time_c_1'})
+
+
+        task_center.userdata.c_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('C_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'C_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'c_4'})
+
+        task_center.userdata.c_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('C_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_C_2',
+                                             'aborted':'C_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'c_5'})
+
+	task_center.userdata.time_c_2 = 1
+        smach.StateMachine.add('PAUSE_C_2', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_C'},
+                                remapping={'input_time':'time_c_2'})
+
+	smach.StateMachine.add('GO_TO_POINT_C',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_2),
+                                transitions={'succeeded':'PAUSE_C_3'})
+
+
+	task_center.userdata.time_c_3 = 2
+        smach.StateMachine.add('PAUSE_C_3', Pause(),
+                                transitions={'succeeded':'MOVE_D'},
+                                remapping={'input_time':'time_c_3'})
+
+
+	#Swip 3
+
+	task_center.userdata.move_vel_dist_d_1 = [0.06, 0.1]
+        smach.StateMachine.add('MOVE_D', Move(),
+                              transitions={'succeeded':'MOVE_D_1'},
+                              remapping={'input_speed_distance':'move_vel_dist_d_1'})
+
+	task_center.userdata.move_vel_dist_d_2 = [0.2, 3.1]
+        smach.StateMachine.add('MOVE_D_1', Move(),
+                              transitions={'succeeded':'PAUSE_D'},
+                              remapping={'input_speed_distance':'move_vel_dist_d_2'})
+
+	task_center.userdata.time_d = 2
+        smach.StateMachine.add('PAUSE_D', Pause(),
+                                transitions={'succeeded':'D_0'},
+                                remapping={'input_time':'time_d'})
+
+        task_center.userdata.d_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('D_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'D_1',
+                                            'aborted':'D_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'d_0'})
+
+        task_center.userdata.d_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('D_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'D_2',
+                                            'aborted':'D_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'d_1'})
+
+
+        task_center.userdata.d_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('D_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'D_3',
+                                            'aborted':'D_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'d_2'})
+
+
+        task_center.userdata.d_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('D_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_D_1',
+                                            'aborted':'D_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'d_3'})
+
+
+        task_center.userdata.time_d_1 = 1
+        smach.StateMachine.add('PAUSE_D_1', Pause(),
+                                transitions={'succeeded':'D_4'},
+                                remapping={'input_time':'time_d_1'})
+
+
+        task_center.userdata.d_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('D_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'D_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'d_4'})
+
+        task_center.userdata.d_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('D_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_D_2',
+                                             'aborted':'D_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'d_5'})
+
+	task_center.userdata.time_d_2 = 1
+        smach.StateMachine.add('PAUSE_D_2', Pause(),
+                                transitions={'succeeded':'GO_TO_Trashcan_1'},
+                                remapping={'input_time':'time_c_2'})
+
+        # GO_TO_TC
+
+	smach.StateMachine.add('GO_TO_Trashcan_1',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_trashcan),
+                                transitions={'succeeded':'MOVE_D_5'})
+
+
+
+	task_center.userdata.move_vel_dist_d_3 = [-0.05, 0.30]
+        smach.StateMachine.add('MOVE_D_5', Move(),
+                              transitions={'succeeded':'PAUSE_D_3'},
+                              remapping={'input_speed_distance':'move_vel_dist_d_3'})
+
+
+	task_center.userdata.time_d_3 = 2
+        smach.StateMachine.add('PAUSE_D_3', Pause(),
+                                transitions={'succeeded':'THROW_1'},
+                                remapping={'input_time':'time_d_3'})
+
+	# THROW AWAY_A
+
+        task_center.userdata.throw_1 = [1.5535, -0.1, 0.0, 0.0]
+        smach.StateMachine.add('THROW_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_2',
+                                            'aborted':'THROW_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_1'})
+
+        task_center.userdata.throw_2 = [1.5535, 0.72, -0.61, 1.31]
+        smach.StateMachine.add('THROW_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_3',
+                                            'aborted':'THROW_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_2'})
+
+        task_center.userdata.throw_3 = [0.005]
+        smach.StateMachine.add('THROW_3',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_4'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_3'})
+
+        task_center.userdata.throw_4 = [1.5535, -0.1, 0.0, 0.0]
+        smach.StateMachine.add('THROW_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'SET_INIT_POSITION',
+                                            'aborted':'THROW_4'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_4'})
+
+        task_center.userdata.init_position = [0.0, -0.1, 0.0, 0.0]
+        smach.StateMachine.add('SET_INIT_POSITION',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'GRIP_POSE',
+                                            'aborted':'SET_INIT_POSITION'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'init_position'})
+
+        task_center.userdata.grip_position = [0.0, 0.6103, -0.02, 0.9680]
+        smach.StateMachine.add('GRIP_POSE',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'CLOSE_GRIPPER',
+                                            'aborted':'GRIP_POSE'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'grip_position'})
+
+
+
+        task_center.userdata.gripper = [-0.008]
+        smach.StateMachine.add('CLOSE_GRIPPER',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'MOVE_Z'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'gripper'})
+
+        task_center.userdata.move_z_position = [0.0, 0.15, -0.6164, 1.844]
+        smach.StateMachine.add('MOVE_Z',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'MOVE_X',
+                                            'aborted':'MOVE_Z'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_z_position'})
+
+        task_center.userdata.move_x_position = [0.0, -0.5, -0.01, 1.97]
+        smach.StateMachine.add('MOVE_X',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW',
+                                            'aborted':'MOVE_X'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_x_position'})
+
+
+        task_center.userdata.throw_position = [0.0, -0.86, -0.9, -0.9]
+        smach.StateMachine.add('THROW',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_2,
+                                                response_cb=joint_position_response_cb_2,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_THROW_0',
+                                            'aborted':'THROW'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'throw_position'})
+
+	task_center.userdata.time_throw_0 = 1
+        smach.StateMachine.add('PAUSE_THROW_0', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_X'},
+                                remapping={'input_time':'time_throw_0'})
+
+
+
+        task_center.userdata.return_move_x_position = [0.0, -0.5, -0.01, 1.97]
+        smach.StateMachine.add('RETURN_MOVE_X',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'RETURN_MOVE_Z',
+                                            'aborted':'RETURN_MOVE_X'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_move_x_position'})
+
+	task_center.userdata.time_throw_1 = 1
+        smach.StateMachine.add('PAUSE_THROW_1', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_Z'},
+                                remapping={'input_time':'time_throw_1'})
+
+        task_center.userdata.return_move_z_position = [0.0, 0.15, -0.6164, 1.844]
+        smach.StateMachine.add('RETURN_MOVE_Z',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                               SetJointPosition,
+                                               request_cb=joint_position_request_cb,
+                                               response_cb=joint_position_response_cb,
+                                               input_keys=['input_planning_group',
+                                                           'input_position']),
+                                transitions={'succeeded':'RETURN_GRIP_POSE',
+                                             'aborted':'RETURN_MOVE_Z'},
+                                remapping={'input_planning_group':'planning_group',
+                                           'input_position':'return_move_z_position'})
+
+
+        task_center.userdata.return_grip_position = [0.0, 0.6103, -0.02, 0.9680]
+        smach.StateMachine.add('RETURN_GRIP_POSE',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'OPEN_GRIPPER',
+                                            'aborted':'RETURN_GRIP_POSE'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_grip_position'})
+
+
+        task_center.userdata.open_gripper = [0.005]
+        smach.StateMachine.add('OPEN_GRIPPER',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'RETURN_SET_INIT_POSITION',
+                                            'aborted':'OPEN_GRIPPER'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'open_gripper'})
+
+        task_center.userdata.return_init_position = [0.0, -0.1, 0.0, 0.0]
+        smach.StateMachine.add('RETURN_SET_INIT_POSITION',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_5',
+                                            'aborted':'RETURN_SET_INIT_POSITION'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'return_init_position'})
+
+        task_center.userdata.throw_5 = [1.5535, -0.1, 0.0, 0.0]
+        smach.StateMachine.add('THROW_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_6',
+                                            'aborted':'THROW_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_5'})
+
+        task_center.userdata.throw_6 = [1.5535, 0.72, -0.61, 1.31]
+        smach.StateMachine.add('THROW_6',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_7',
+                                            'aborted':'THROW_6'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_6'})
+
+        task_center.userdata.throw_7 = [-0.005]
+        smach.StateMachine.add('THROW_7',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_8'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_7'})
+
+        task_center.userdata.throw_8 = [1.5535, -0.1, 0.0, 0.0]
+        smach.StateMachine.add('THROW_8',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_9',
+                                            'aborted':'THROW_8'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_8'})
+
+        task_center.userdata.throw_9 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('THROW_9',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_E',
+                                            'aborted':'THROW_9'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_9'})
+
+	#Swip 4
+
+	task_center.userdata.time_e = 1
+        smach.StateMachine.add('PAUSE_E', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_E'},
+                                remapping={'input_time':'time_e'})
+
+	smach.StateMachine.add('GO_TO_POINT_E',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_3),
+                                transitions={'succeeded':'PAUSE_E_1'})
+
+	task_center.userdata.time_e_1 = 2
+        smach.StateMachine.add('PAUSE_E_1', Pause(),
+                                transitions={'succeeded':'MOVE_E'},
+                                remapping={'input_time':'time_e_1'})
+
+	task_center.userdata.move_vel_dist_e_1 = [0.06, 0.1]
+        smach.StateMachine.add('MOVE_E', Move(),
+                              transitions={'succeeded':'MOVE_E_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_e_1'})
+
+	task_center.userdata.move_vel_dist_e_3 = [0.2, 3.1]
+        smach.StateMachine.add('MOVE_E_2', Move(),
+                              transitions={'succeeded':'PAUSE_E_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_e_3'})
+
+	task_center.userdata.time_e_2 = 2
+        smach.StateMachine.add('PAUSE_E_2', Pause(),
+                                transitions={'succeeded':'E_0'},
+                                remapping={'input_time':'time_e_2'})
+
+        task_center.userdata.e_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('E_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'E_1',
+                                            'aborted':'E_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'e_0'})
+
+        task_center.userdata.e_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('E_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'E_2',
+                                            'aborted':'E_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'e_1'})
+
+
+        task_center.userdata.e_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('E_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'E_3',
+                                            'aborted':'E_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'e_2'})
+
+
+        task_center.userdata.e_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('E_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_E_3',
+                                            'aborted':'E_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'e_3'})
+
+
+        task_center.userdata.time_e_3 = 1
+        smach.StateMachine.add('PAUSE_E_3', Pause(),
+                                transitions={'succeeded':'E_4'},
+                                remapping={'input_time':'time_e_3'})
+
+
+        task_center.userdata.e_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('E_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'E_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'e_4'})
+
+        task_center.userdata.e_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('E_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_E_4',
+                                             'aborted':'E_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'e_5'})
+
+	task_center.userdata.time_e_4 = 1
+        smach.StateMachine.add('PAUSE_E_4', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_E_1'},
+                                remapping={'input_time':'time_e_4'})
+
+	smach.StateMachine.add('GO_TO_POINT_E_1',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_4),
+                                transitions={'succeeded':'PAUSE_E_5'})
+
+
+	task_center.userdata.time_e_5 = 2
+        smach.StateMachine.add('PAUSE_E_5', Pause(),
+                                transitions={'succeeded':'MOVE_F'},
+                                remapping={'input_time':'time_e_5'})
+
+	#Swip 5
+
+	task_center.userdata.move_vel_dist_f_1 = [0.2, 3.2]
+        smach.StateMachine.add('MOVE_F', Move(),
+                              transitions={'succeeded':'PAUSE_F'},
+                              remapping={'input_speed_distance':'move_vel_dist_f_1'})
+
+	task_center.userdata.time_f = 2
+        smach.StateMachine.add('PAUSE_F', Pause(),
+                                transitions={'succeeded':'F_0'},
+                                remapping={'input_time':'time_f'})
+
+        task_center.userdata.f_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('F_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'F_1',
+                                            'aborted':'F_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'f_0'})
+
+        task_center.userdata.f_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('F_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'F_2',
+                                            'aborted':'F_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'f_1'})
+
+
+        task_center.userdata.f_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('F_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'F_3',
+                                            'aborted':'F_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'f_2'})
+
+
+        task_center.userdata.f_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('F_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_F_1',
+                                            'aborted':'F_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'f_3'})
+
+
+        task_center.userdata.time_f_1 = 1
+        smach.StateMachine.add('PAUSE_F_1', Pause(),
+                                transitions={'succeeded':'F_4'},
+                                remapping={'input_time':'time_f_1'})
+
+
+        task_center.userdata.f_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('F_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'F_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'f_4'})
+
+        task_center.userdata.f_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('F_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_F_2',
+                                             'aborted':'F_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'f_5'})
+
+	task_center.userdata.time_f_2 = 1
+        smach.StateMachine.add('PAUSE_F_2', Pause(),
+                                transitions={'succeeded':'GO_TO_Trashcan_2'},
+                                remapping={'input_time':'time_f_2'})
+
+        # GO_TO_TC
+
+	smach.StateMachine.add('GO_TO_Trashcan_2',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_trashcan),
+                                transitions={'succeeded':'MOVE_F_5'})
+
+
+
+	task_center.userdata.move_vel_dist_f_3 = [-0.05, 0.30]
+        smach.StateMachine.add('MOVE_F_5', Move(),
+                              transitions={'succeeded':'PAUSE_F_3'},
+                              remapping={'input_speed_distance':'move_vel_dist_f_3'})
+
+
+	task_center.userdata.time_f_3 = 2
+        smach.StateMachine.add('PAUSE_F_3', Pause(),
+                                transitions={'succeeded':'THROW_1_B'},
+                                remapping={'input_time':'time_f_3'})
+
+	# THROW AWAY_B
+
+        smach.StateMachine.add('THROW_1_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_2_B',
+                                            'aborted':'THROW_1_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_1'})
+
+        smach.StateMachine.add('THROW_2_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_3_B',
+                                            'aborted':'THROW_2_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_2'})
+
+        smach.StateMachine.add('THROW_3_B',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_4_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_3'})
+
+        smach.StateMachine.add('THROW_4_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'SET_INIT_POSITION_B',
+                                            'aborted':'THROW_4_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_4'})
+
+        smach.StateMachine.add('SET_INIT_POSITION_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'GRIP_POSE_B',
+                                            'aborted':'SET_INIT_POSITION_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'init_position'})
+
+        smach.StateMachine.add('GRIP_POSE_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'CLOSE_GRIPPER_B',
+                                            'aborted':'GRIP_POSE_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'grip_position'})
+
+
+        smach.StateMachine.add('CLOSE_GRIPPER_B',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'MOVE_Z_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'gripper'})
+
+        smach.StateMachine.add('MOVE_Z_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'MOVE_X_B',
+                                            'aborted':'MOVE_Z_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_z_position'})
+
+        smach.StateMachine.add('MOVE_X_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_B',
+                                            'aborted':'MOVE_X_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_x_position'})
+
+
+        smach.StateMachine.add('THROW_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_2,
+                                                response_cb=joint_position_response_cb_2,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_THROW_0_B',
+                                            'aborted':'THROW_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'throw_position'})
+
+        smach.StateMachine.add('PAUSE_THROW_0_B', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_X_B'},
+                                remapping={'input_time':'time_throw_0'})
+
+
+
+        smach.StateMachine.add('RETURN_MOVE_X_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'RETURN_MOVE_Z_B',
+                                            'aborted':'RETURN_MOVE_X_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_move_x_position'})
+
+        smach.StateMachine.add('PAUSE_THROW_1_B', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_Z_B'},
+                                remapping={'input_time':'time_throw_1'})
+
+        smach.StateMachine.add('RETURN_MOVE_Z_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                               SetJointPosition,
+                                               request_cb=joint_position_request_cb,
+                                               response_cb=joint_position_response_cb,
+                                               input_keys=['input_planning_group',
+                                                           'input_position']),
+                                transitions={'succeeded':'RETURN_GRIP_POSE_B',
+                                             'aborted':'RETURN_MOVE_Z_B'},
+                                remapping={'input_planning_group':'planning_group',
+                                           'input_position':'return_move_z_position'})
+
+
+        smach.StateMachine.add('RETURN_GRIP_POSE_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'OPEN_GRIPPER_B',
+                                            'aborted':'RETURN_GRIP_POSE_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_grip_position'})
+
+
+        smach.StateMachine.add('OPEN_GRIPPER_B',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'RETURN_SET_INIT_POSITION_B',
+                                            'aborted':'OPEN_GRIPPER_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'open_gripper'})
+
+        smach.StateMachine.add('RETURN_SET_INIT_POSITION_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_5_B',
+                                            'aborted':'RETURN_SET_INIT_POSITION_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'return_init_position'})
+
+        smach.StateMachine.add('THROW_5_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_6_B',
+                                            'aborted':'THROW_5_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_5'})
+
+        smach.StateMachine.add('THROW_6_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_7_B',
+                                            'aborted':'THROW_6_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_6'})
+
+        smach.StateMachine.add('THROW_7_B',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_8_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_7'})
+
+        smach.StateMachine.add('THROW_8_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_9_B',
+                                            'aborted':'THROW_8_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_8'})
+
+        smach.StateMachine.add('THROW_9_B',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_G',
+                                            'aborted':'THROW_9_B'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_9'})
+
+	#Swip 6
+
+	task_center.userdata.time_g = 1
+        smach.StateMachine.add('PAUSE_G', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_G'},
+                                remapping={'input_time':'time_g'})
+
+	smach.StateMachine.add('GO_TO_POINT_G',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_5),
+                                transitions={'succeeded':'PAUSE_G_1'})
+
+	task_center.userdata.time_g_1 = 2
+        smach.StateMachine.add('PAUSE_G_1', Pause(),
+                                transitions={'succeeded':'MOVE_G'},
+                                remapping={'input_time':'time_g_1'})
+
+	task_center.userdata.move_vel_dist_g_1 = [0.06, 0.1]
+        smach.StateMachine.add('MOVE_G', Move(),
+                              transitions={'succeeded':'MOVE_G_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_g_1'})
+
+	task_center.userdata.move_vel_dist_g_3 = [0.2, 3.1]
+        smach.StateMachine.add('MOVE_G_2', Move(),
+                              transitions={'succeeded':'PAUSE_G_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_g_3'})
+
+	task_center.userdata.time_g_2 = 2
+        smach.StateMachine.add('PAUSE_G_2', Pause(),
+                                transitions={'succeeded':'G_0'},
+                                remapping={'input_time':'time_g_2'})
+
+        task_center.userdata.g_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('G_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'G_1',
+                                            'aborted':'G_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'g_0'})
+
+        task_center.userdata.g_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('G_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'G_2',
+                                            'aborted':'G_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'g_1'})
+
+
+        task_center.userdata.g_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('G_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'G_3',
+                                            'aborted':'G_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'g_2'})
+
+
+        task_center.userdata.g_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('G_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_G_3',
+                                            'aborted':'G_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'g_3'})
+
+
+        task_center.userdata.time_g_3 = 1
+        smach.StateMachine.add('PAUSE_G_3', Pause(),
+                                transitions={'succeeded':'G_4'},
+                                remapping={'input_time':'time_g_3'})
+
+
+        task_center.userdata.g_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('G_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'G_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'g_4'})
+
+        task_center.userdata.g_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('G_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_G_4',
+                                             'aborted':'G_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'g_5'})
+
+	task_center.userdata.time_g_4 = 1
+        smach.StateMachine.add('PAUSE_G_4', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_G_1'},
+                                remapping={'input_time':'time_g_4'})
+
+	smach.StateMachine.add('GO_TO_POINT_G_1',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_6),
+                                transitions={'succeeded':'PAUSE_G_5'})
+
+
+	task_center.userdata.time_g_5 = 2
+        smach.StateMachine.add('PAUSE_G_5', Pause(),
+                                transitions={'succeeded':'MOVE_H'},
+                                remapping={'input_time':'time_g_5'})
+
+	#Swip 7
+
+	task_center.userdata.move_vel_dist_h_1 = [0.2, 3.2]
+        smach.StateMachine.add('MOVE_H', Move(),
+                              transitions={'succeeded':'PAUSE_H'},
+                              remapping={'input_speed_distance':'move_vel_dist_h_1'})
+
+	task_center.userdata.time_h = 2
+        smach.StateMachine.add('PAUSE_H', Pause(),
+                                transitions={'succeeded':'H_0'},
+                                remapping={'input_time':'time_h'})
+
+        task_center.userdata.h_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('H_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'H_1',
+                                            'aborted':'H_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'h_0'})
+
+        task_center.userdata.h_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('H_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'H_2',
+                                            'aborted':'H_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'h_1'})
+
+
+        task_center.userdata.h_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('H_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'H_3',
+                                            'aborted':'H_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'h_2'})
+
+
+        task_center.userdata.h_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('H_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_H_1',
+                                            'aborted':'H_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'h_3'})
+
+
+        task_center.userdata.time_h_1 = 1
+        smach.StateMachine.add('PAUSE_H_1', Pause(),
+                                transitions={'succeeded':'H_4'},
+                                remapping={'input_time':'time_h_1'})
+
+
+        task_center.userdata.h_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('H_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'H_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'h_4'})
+
+        task_center.userdata.h_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('H_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_H_2',
+                                             'aborted':'H_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'h_5'})
+
+	task_center.userdata.time_h_2 = 1
+        smach.StateMachine.add('PAUSE_H_2', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_91'},
+                                remapping={'input_time':'time_h_2'})
+
+
+	smach.StateMachine.add('GO_TO_POINT_91',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_91),
+                                transitions={'succeeded':'GO_TO_Trashcan_3'})
+	
+        # GO_TO_TC
+
+	smach.StateMachine.add('GO_TO_Trashcan_3',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_trashcan),
+                                transitions={'succeeded':'MOVE_H_5'})
+
+
+
+	task_center.userdata.move_vel_dist_h_3 = [-0.05, 0.30]
+        smach.StateMachine.add('MOVE_H_5', Move(),
+                              transitions={'succeeded':'PAUSE_H_3'},
+                              remapping={'input_speed_distance':'move_vel_dist_h_3'})
+
+
+	task_center.userdata.time_h_3 = 2
+        smach.StateMachine.add('PAUSE_H_3', Pause(),
+                                transitions={'succeeded':'THROW_1_C'},
+                                remapping={'input_time':'time_h_3'})
+	
+
+	# THROW AWAY_C
+
+        smach.StateMachine.add('THROW_1_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_2_C',
+                                            'aborted':'THROW_1_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_1'})
+
+        smach.StateMachine.add('THROW_2_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_3_C',
+                                            'aborted':'THROW_2_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_2'})
+
+        smach.StateMachine.add('THROW_3_C',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_4_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_3'})
+
+        smach.StateMachine.add('THROW_4_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'SET_INIT_POSITION_C',
+                                            'aborted':'THROW_4_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_4'})
+
+        smach.StateMachine.add('SET_INIT_POSITION_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'GRIP_POSE_C',
+                                            'aborted':'SET_INIT_POSITION_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'init_position'})
+
+        smach.StateMachine.add('GRIP_POSE_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'CLOSE_GRIPPER_C',
+                                            'aborted':'GRIP_POSE_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'grip_position'})
+
+
+        smach.StateMachine.add('CLOSE_GRIPPER_C',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'MOVE_Z_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'gripper'})
+
+        smach.StateMachine.add('MOVE_Z_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'MOVE_X_C',
+                                            'aborted':'MOVE_Z_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_z_position'})
+
+        smach.StateMachine.add('MOVE_X_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_C',
+                                            'aborted':'MOVE_X_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_x_position'})
+
+
+        smach.StateMachine.add('THROW_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_2,
+                                                response_cb=joint_position_response_cb_2,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_THROW_0_C',
+                                            'aborted':'THROW_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'throw_position'})
+
+        smach.StateMachine.add('PAUSE_THROW_0_C', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_X_C'},
+                                remapping={'input_time':'time_throw_0'})
+
+
+
+        smach.StateMachine.add('RETURN_MOVE_X_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'RETURN_MOVE_Z_C',
+                                            'aborted':'RETURN_MOVE_X_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_move_x_position'})
+
+        smach.StateMachine.add('PAUSE_THROW_1_C', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_Z_C'},
+                                remapping={'input_time':'time_throw_1'})
+
+        smach.StateMachine.add('RETURN_MOVE_Z_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                               SetJointPosition,
+                                               request_cb=joint_position_request_cb,
+                                               response_cb=joint_position_response_cb,
+                                               input_keys=['input_planning_group',
+                                                           'input_position']),
+                                transitions={'succeeded':'RETURN_GRIP_POSE_C',
+                                             'aborted':'RETURN_MOVE_Z_C'},
+                                remapping={'input_planning_group':'planning_group',
+                                           'input_position':'return_move_z_position'})
+
+
+        smach.StateMachine.add('RETURN_GRIP_POSE_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'OPEN_GRIPPER_C',
+                                            'aborted':'RETURN_GRIP_POSE_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_grip_position'})
+
+
+        smach.StateMachine.add('OPEN_GRIPPER_C',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'RETURN_SET_INIT_POSITION_C',
+                                            'aborted':'OPEN_GRIPPER_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'open_gripper'})
+
+        smach.StateMachine.add('RETURN_SET_INIT_POSITION_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_5_C',
+                                            'aborted':'RETURN_SET_INIT_POSITION_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'return_init_position'})
+
+        smach.StateMachine.add('THROW_5_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_6_C',
+                                            'aborted':'THROW_5_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_5'})
+
+        smach.StateMachine.add('THROW_6_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_7_C',
+                                            'aborted':'THROW_6_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_6'})
+
+        smach.StateMachine.add('THROW_7_C',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_8_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_7'})
+
+        smach.StateMachine.add('THROW_8_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_9_C',
+                                            'aborted':'THROW_8_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_8'})
+
+        smach.StateMachine.add('THROW_9_C',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_I',
+                                            'aborted':'THROW_9_C'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_9'})
+	
+	#Swip 8
+
+	task_center.userdata.time_i = 1
+        smach.StateMachine.add('PAUSE_I', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_I'},
+                                remapping={'input_time':'time_i'})
+
+	smach.StateMachine.add('GO_TO_POINT_I',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_7),
+                                transitions={'succeeded':'PAUSE_I_1'})
+
+	task_center.userdata.time_i_1 = 2
+        smach.StateMachine.add('PAUSE_I_1', Pause(),
+                                transitions={'succeeded':'MOVE_I'},
+                                remapping={'input_time':'time_i_1'})
+
+	task_center.userdata.move_vel_dist_i_1 = [0.06, 0.1]
+        smach.StateMachine.add('MOVE_I', Move(),
+                              transitions={'succeeded':'MOVE_I_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_i_1'})
+
+	task_center.userdata.move_vel_dist_i_3 = [0.2, 3.1]
+        smach.StateMachine.add('MOVE_I_2', Move(),
+                              transitions={'succeeded':'PAUSE_I_2'},
+                              remapping={'input_speed_distance':'move_vel_dist_i_3'})
+
+	task_center.userdata.time_i_2 = 2
+        smach.StateMachine.add('PAUSE_I_2', Pause(),
+                                transitions={'succeeded':'I_0'},
+                                remapping={'input_time':'time_i_2'})
+
+        task_center.userdata.i_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('I_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'I_1',
+                                            'aborted':'I_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'i_0'})
+
+        task_center.userdata.i_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('I_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'I_2',
+                                            'aborted':'I_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'i_1'})
+
+
+        task_center.userdata.i_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('I_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'I_3',
+                                            'aborted':'I_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'i_2'})
+
+
+        task_center.userdata.i_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('I_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_I_3',
+                                            'aborted':'I_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'i_3'})
+
+
+        task_center.userdata.time_i_3 = 1
+        smach.StateMachine.add('PAUSE_I_3', Pause(),
+                                transitions={'succeeded':'I_4'},
+                                remapping={'input_time':'time_i_3'})
+
+
+        task_center.userdata.i_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('I_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'I_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'i_4'})
+
+        task_center.userdata.i_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('I_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_I_4',
+                                             'aborted':'I_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'i_5'})
+
+	task_center.userdata.time_i_4 = 1
+        smach.StateMachine.add('PAUSE_I_4', Pause(),
+                                transitions={'succeeded':'GO_TO_POINT_I_1'},
+                                remapping={'input_time':'time_i_4'})
+
+	smach.StateMachine.add('GO_TO_POINT_I_1',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_point_8),
+                                transitions={'succeeded':'PAUSE_I_5'})
+
+
+	task_center.userdata.time_i_5 = 2
+        smach.StateMachine.add('PAUSE_I_5', Pause(),
+                                transitions={'succeeded':'MOVE_J'},
+                                remapping={'input_time':'time_i_5'})
+
+	#Swip 9
+
+	task_center.userdata.move_vel_dist_j_1 = [0.2, 2.65]
+        smach.StateMachine.add('MOVE_J', Move(),
+                              transitions={'succeeded':'PAUSE_J'},
+                              remapping={'input_speed_distance':'move_vel_dist_j_1'})
+
+	task_center.userdata.time_j = 2
+        smach.StateMachine.add('PAUSE_J', Pause(),
+                                transitions={'succeeded':'J_0'},
+                                remapping={'input_time':'time_j'})
+
+        task_center.userdata.j_0 = [0, 0.4625, 0.1433, -0.5272]
+        smach.StateMachine.add('J_0',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'J_1',
+                                            'aborted':'J_0'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'j_0'})
+
+        task_center.userdata.j_1 = [0, 0.7581, -0.7636, 0]
+        smach.StateMachine.add('J_1',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'J_2',
+                                            'aborted':'J_1'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'j_1'})
+
+
+        task_center.userdata.j_2 = [0, 1.0, -0.9424, 0]
+        smach.StateMachine.add('J_2',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'J_3',
+                                            'aborted':'J_2'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'j_2'})
+
+
+        task_center.userdata.j_3 = [0, 0.35, 0.0028, 0.2]
+        smach.StateMachine.add('J_3',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_J_1',
+                                            'aborted':'J_3'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'j_3'})
+
+
+        task_center.userdata.time_j_1 = 1
+        smach.StateMachine.add('PAUSE_J_1', Pause(),
+                                transitions={'succeeded':'J_4'},
+                                remapping={'input_time':'time_j_1'})
+
+
+        task_center.userdata.j_4 = [0, -0.1, 0, 0]
+        smach.StateMachine.add('J_4',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'J_5'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'j_4'})
+
+        task_center.userdata.j_5 = [0, -1.3105, 0.9991, 0]
+        smach.StateMachine.add('J_5',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_1,
+                                                response_cb=joint_position_response_cb_1,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                                transitions={'succeeded':'PAUSE_J_2',
+                                             'aborted':'J_5'},
+                                remapping={'input_planning_group':'planning_group',
+                                         'input_position':'j_5'})
+
+	task_center.userdata.time_j_2 = 1
+        smach.StateMachine.add('PAUSE_J_2', Pause(),
+                                transitions={'succeeded':'GO_TO_Trashcan_4'},
+                                remapping={'input_time':'time_j_2'})
+
+        # GO_TO_TC
+
+	smach.StateMachine.add('GO_TO_Trashcan_4',
+                                SimpleActionState(namespace + "/move_base",
+                                                MoveBaseAction,
+                                                goal=the_location_of_trashcan),
+                                transitions={'succeeded':'MOVE_J_5'})
+
+
+
+	task_center.userdata.move_vel_dist_j_3 = [-0.05, 0.30]
+        smach.StateMachine.add('MOVE_J_5', Move(),
+                              transitions={'succeeded':'PAUSE_J_3'},
+                              remapping={'input_speed_distance':'move_vel_dist_j_3'})
+
+
+	task_center.userdata.time_j_3 = 2
+        smach.StateMachine.add('PAUSE_J_3', Pause(),
+                                transitions={'succeeded':'THROW_1_D'},
+                                remapping={'input_time':'time_j_3'})
+
+	# THROW AWAY_D
+
+        smach.StateMachine.add('THROW_1_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_2_D',
+                                            'aborted':'THROW_1_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_1'})
+
+        smach.StateMachine.add('THROW_2_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_3_D',
+                                            'aborted':'THROW_2_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_2'})
+
+        smach.StateMachine.add('THROW_3_D',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_4_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_3'})
+
+        smach.StateMachine.add('THROW_4_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'SET_INIT_POSITION_D',
+                                            'aborted':'THROW_4_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_4'})
+
+        smach.StateMachine.add('SET_INIT_POSITION_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'GRIP_POSE_D',
+                                            'aborted':'SET_INIT_POSITION_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'init_position'})
+
+        smach.StateMachine.add('GRIP_POSE_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'CLOSE_GRIPPER_D',
+                                            'aborted':'GRIP_POSE_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'grip_position'})
+
+
+        smach.StateMachine.add('CLOSE_GRIPPER_D',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'MOVE_Z_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'gripper'})
+
+        smach.StateMachine.add('MOVE_Z_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'MOVE_X_D',
+                                            'aborted':'MOVE_Z_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_z_position'})
+
+        smach.StateMachine.add('MOVE_X_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_D',
+                                            'aborted':'MOVE_X_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'move_x_position'})
+
+
+        smach.StateMachine.add('THROW_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb_2,
+                                                response_cb=joint_position_response_cb_2,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_THROW_0_D',
+                                            'aborted':'THROW_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'throw_position'})
+
+        smach.StateMachine.add('PAUSE_THROW_0_D', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_X_D'},
+                                remapping={'input_time':'time_throw_0'})
+
+
+
+        smach.StateMachine.add('RETURN_MOVE_X_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'PAUSE_THROW_1_D',
+                                            'aborted':'RETURN_MOVE_X_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_move_x_position'})
+
+        smach.StateMachine.add('PAUSE_THROW_1_D', Pause(),
+                                transitions={'succeeded':'RETURN_MOVE_Z_D'},
+                                remapping={'input_time':'time_throw_1'})
+
+        smach.StateMachine.add('RETURN_MOVE_Z_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                               SetJointPosition,
+                                               request_cb=joint_position_request_cb,
+                                               response_cb=joint_position_response_cb,
+                                               input_keys=['input_planning_group',
+                                                           'input_position']),
+                                transitions={'succeeded':'RETURN_GRIP_POSE_D',
+                                             'aborted':'RETURN_MOVE_Z_D'},
+                                remapping={'input_planning_group':'planning_group',
+                                           'input_position':'return_move_z_position'})
+
+
+        smach.StateMachine.add('RETURN_GRIP_POSE_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'OPEN_GRIPPER_D',
+                                            'aborted':'RETURN_GRIP_POSE_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_position':'return_grip_position'})
+
+
+        smach.StateMachine.add('OPEN_GRIPPER_D',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'RETURN_SET_INIT_POSITION_D',
+                                            'aborted':'OPEN_GRIPPER_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'open_gripper'})
+
+        smach.StateMachine.add('RETURN_SET_INIT_POSITION_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_5_D',
+                                            'aborted':'RETURN_SET_INIT_POSITION_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'return_init_position'})
+
+        smach.StateMachine.add('THROW_5_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_6_D',
+                                            'aborted':'THROW_5_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_5'})
+
+        smach.StateMachine.add('THROW_6_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_7_D',
+                                            'aborted':'THROW_6_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_6'})
+
+        smach.StateMachine.add('THROW_7_D',
+                                ServiceState(namespace + '/gripper',
+                                                SetJointPosition,
+                                                request_cb=gripper_request_cb,
+                                                response_cb=gripper_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_gripper']),
+                               transitions={'succeeded':'THROW_8_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                        'input_gripper':'throw_7'})
+
+        smach.StateMachine.add('THROW_8_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'THROW_9_D',
+                                            'aborted':'THROW_8_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_8'})
+
+        smach.StateMachine.add('THROW_9_D',
+                                ServiceState(planning_group + '/moveit/set_joint_position',
+                                                SetJointPosition,
+                                                request_cb=joint_position_request_cb,
+                                                response_cb=joint_position_response_cb,
+                                                input_keys=['input_planning_group',
+                                                            'input_position']),
+                               transitions={'succeeded':'GO_TO_ORIGIN_1',
+                                            'aborted':'THROW_9_D'},
+                               remapping={'input_planning_group':'planning_group',
+                                          'input_position':'throw_9'})
+
+		
+    sis = smach_ros.IntrospectionServer('server_name', task_center, '/TASKS_CENTER')
+
+    sis.start()
+
+    # Execute SMACH plan
+    outcome = task_center.execute()
+
+    # Wait for ctrl-c to stop the application
+    rospy.spin()
+    sis.stop()
+
+if __name__ == '__main__':
+    main()
