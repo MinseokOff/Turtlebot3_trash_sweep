@@ -1,4 +1,4 @@
-# Turtlebot3_trash_swip
+# Turtlebot3_trash_sweep
 
 ## Test_Video
 [![Video Label](http://img.youtube.com/vi/A5QSnYqkHds/0.jpg)](https://youtu.be/A5QSnYqkHds?t=0s)
